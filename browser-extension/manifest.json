@@ -1,0 +1,14 @@
+{
+  "manifest_version": 3,
+  "name": "Activity Tracker Focused Tab",
+  "description": "Sends focused Chrome/Edge tab metadata to the local Activity Tracker desktop app.",
+  "version": "0.1.0",
+  "permissions": ["tabs", "windows"],
+  "host_permissions": ["<all_urls>", "http://127.0.0.1:8765/*"],
+  "background": {
+    "service_worker": "service_worker.js"
+  },
+  "action": {
+    "default_title": "Activity Tracker"
+  }
+}
