@@ -21,17 +21,83 @@ Requirements:
 - Windows
 - Python 3.10 or newer
 
-Run:
+There are two ways to run the app:
+
+- **Development mode:** run the Python source code while working on the project.
+- **Portable app mode:** run the packaged `.exe` after building it with PyInstaller.
+
+For development, run:
 
 ```powershell
 python app\activity_tracker.py
 ```
 
-The local database is created at:
+When running from source, the local database is created at:
 
 ```text
 %LOCALAPPDATA%\ActivityTracker\activity_tracker.sqlite3
 ```
+
+## Build the Windows App
+
+Use PyInstaller to package the Tkinter app as a normal Windows executable.
+
+Recommended first-time setup:
+
+```powershell
+python -m venv .venv
+.\.venv\Scripts\Activate.ps1
+python -m pip install -r requirements-build.txt
+.\scripts\build-windows-exe.ps1
+```
+
+Or install the build requirement and build in one command:
+
+```powershell
+.\scripts\build-windows-exe.ps1 -InstallBuildRequirements
+```
+
+If PyInstaller is already installed, build without reinstalling requirements:
+
+```powershell
+.\scripts\build-windows-exe.ps1
+```
+
+The executable is created at:
+
+```text
+release\Activity Tracker\Activity Tracker.exe
+```
+
+You can open that `.exe` directly from File Explorer without VS Code or a terminal.
+
+When running the packaged executable, the database is created inside the portable app folder:
+
+```text
+release\Activity Tracker\data\activity_tracker.sqlite3
+```
+
+Keep the whole `release\Activity Tracker` folder together. The `data` folder contains that user's local activity history.
+
+After changing source code, rebuild the executable. The `.exe` does not update automatically from Python source changes.
+
+## Start Automatically After Laptop Login
+
+After building the executable, add it to your Windows Startup folder:
+
+```powershell
+.\scripts\install-startup-shortcut.ps1
+```
+
+This creates a shortcut named `Activity Tracker.lnk` in your user Startup folder. Windows will launch the app after you sign in.
+
+To remove the startup shortcut:
+
+```powershell
+.\scripts\install-startup-shortcut.ps1 -Remove
+```
+
+The app has a single-instance guard. If it is already running and you open it again, it shows a message instead of starting a second copy.
 
 ## Install the Browser Extension Manually
 

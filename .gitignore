@@ -33,6 +33,8 @@ logs/
 # Browser extension/package build artifacts
 dist/
 build/
+release/
+.pyinstaller/
 web-ext-artifacts/
 *.zip
 *.crx

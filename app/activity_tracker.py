@@ -7,6 +7,7 @@ import json
 import os
 import re
 import sqlite3
+import sys
 import threading
 import time
 import zipfile
@@ -21,6 +22,7 @@ from urllib.parse import urlparse
 APP_NAME = "Activity Tracker"
 HTTP_HOST = "127.0.0.1"
 HTTP_PORT = 8765
+INSTANCE_MUTEX_NAME = "Local\\ActivityTrackerDesktopApp"
 PH_TZ = timezone(timedelta(hours=8), name="PHT")
 FOCUS_POLL_SECONDS = 1
 SESSION_SAVE_INTERVAL_SECONDS = 5
@@ -75,10 +77,19 @@ def today_bounds() -> tuple[str, str]:
 
 
 def local_data_dir() -> Path:
+    if getattr(sys, "frozen", False):
+        return Path(sys.executable).resolve().parent / "data"
+
     base = os.environ.get("LOCALAPPDATA")
     if base:
         return Path(base) / "ActivityTracker"
     return Path.cwd() / "data"
+
+
+def already_running() -> bool:
+    kernel32 = ctypes.windll.kernel32
+    kernel32.CreateMutexW(None, False, INSTANCE_MUTEX_NAME)
+    return kernel32.GetLastError() == 183
 
 
 @dataclass(frozen=True)
@@ -807,6 +818,15 @@ WORKBOOK_RELS_XML = """<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
 
 
 def main() -> None:
+    if already_running():
+        ctypes.windll.user32.MessageBoxW(
+            None,
+            "Activity Tracker is already running.",
+            APP_NAME,
+            0x40,
+        )
+        return
+
     db = ActivityDatabase(local_data_dir() / "activity_tracker.sqlite3")
     browser_state = BrowserState()
     server = ExtensionServer(browser_state)
