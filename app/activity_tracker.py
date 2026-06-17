@@ -12,10 +12,10 @@ import threading
 import time
 import zipfile
 from dataclasses import dataclass
-from datetime import UTC, datetime, timedelta, timezone
+from datetime import UTC, date, datetime, timedelta, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
-from tkinter import BOTH, END, LEFT, RIGHT, X, Y, Button, Canvas, Frame, Label, StringVar, Tk, filedialog, ttk
+from tkinter import BOTH, END, LEFT, RIGHT, X, Y, Button, Canvas, Entry, Frame, Label, StringVar, Text, Tk, filedialog, ttk
 from urllib.parse import urlparse
 
 
@@ -68,12 +68,47 @@ def display_duration(seconds: int) -> str:
 
 
 def today_bounds() -> tuple[str, str]:
-    ph_now = datetime.now(PH_TZ)
-    ph_start = ph_now.replace(hour=0, minute=0, second=0, microsecond=0)
+    return ph_date_bounds(datetime.now(PH_TZ).date())
+
+
+def ph_date_bounds(day: date) -> tuple[str, str]:
+    ph_start = datetime(day.year, day.month, day.day, tzinfo=PH_TZ)
     ph_end = ph_start + timedelta(days=1)
     start = ph_start.astimezone(UTC)
     end = ph_end.astimezone(UTC)
     return start.isoformat().replace("+00:00", "Z"), end.isoformat().replace("+00:00", "Z")
+
+
+def ph_range_bounds(start_day: date, end_day: date) -> tuple[str, str]:
+    start, _ = ph_date_bounds(start_day)
+    _, end = ph_date_bounds(end_day)
+    return start, end
+
+
+def this_week_bounds() -> tuple[str, str]:
+    ph_today = datetime.now(PH_TZ).date()
+    week_start = ph_today - timedelta(days=ph_today.weekday())
+    return ph_range_bounds(week_start, ph_today)
+
+
+def this_month_bounds() -> tuple[str, str]:
+    ph_today = datetime.now(PH_TZ).date()
+    month_start = ph_today.replace(day=1)
+    return ph_range_bounds(month_start, ph_today)
+
+
+def parse_date_entry(value: str) -> date | None:
+    value = value.strip()
+    if not value:
+        return None
+    try:
+        return datetime.strptime(value, "%Y-%m-%d").date()
+    except ValueError:
+        return None
+
+
+def current_ph_date_text() -> str:
+    return datetime.now(PH_TZ).strftime("%Y-%m-%d")
 
 
 def local_data_dir() -> Path:
@@ -239,6 +274,32 @@ class ActivityDatabase:
                     order by started_at asc
                     """,
                     (end, start),
+                )
+            )
+
+    def available_days_between(self, start: str | None = None, end: str | None = None) -> list[sqlite3.Row]:
+        clauses = []
+        params: list[str] = []
+        if start:
+            clauses.append("started_at >= ?")
+            params.append(start)
+        if end:
+            clauses.append("started_at < ?")
+            params.append(end)
+        where = "where " + " and ".join(clauses) if clauses else ""
+        with self.lock:
+            return list(
+                self.conn.execute(
+                    f"""
+                    select date(started_at, '+8 hours') as day,
+                           count(*) as session_count,
+                           coalesce(sum(case when activity_type != 'idle' then duration_seconds else 0 end), 0) as active_total
+                    from activity_sessions
+                    {where}
+                    group by day
+                    order by day desc
+                    """,
+                    tuple(params),
                 )
             )
 
@@ -575,6 +636,10 @@ class DashboardApp:
         self.status_var = StringVar(value="Starting")
         self.total_var = StringVar(value="Today: 0s")
         self.pause_var = StringVar(value="Pause")
+        self.timeline_domain_filter_var = StringVar(value="All rows")
+        self.download_range_var = StringVar(value="All available")
+        self.download_start_var = StringVar(value=current_ph_date_text())
+        self.download_end_var = StringVar(value=current_ph_date_text())
         self.root.title(APP_NAME)
         self.root.geometry("980x660")
         self._build()
@@ -592,13 +657,19 @@ class DashboardApp:
 
         self.dashboard_tab = Frame(notebook, padx=12, pady=12)
         self.timeline_tab = Frame(notebook, padx=12, pady=12)
+        self.download_tab = Frame(notebook, padx=12, pady=12)
+        self.guide_tab = Frame(notebook, padx=12, pady=12)
         self.settings_tab = Frame(notebook, padx=12, pady=12)
         notebook.add(self.dashboard_tab, text="Dashboard")
         notebook.add(self.timeline_tab, text="Timeline")
+        notebook.add(self.download_tab, text="Download Data")
+        notebook.add(self.guide_tab, text="Guide")
         notebook.add(self.settings_tab, text="Settings")
 
         self._build_dashboard()
         self._build_timeline()
+        self._build_download()
+        self._build_guide()
         self._build_settings()
 
     def _build_dashboard(self) -> None:
@@ -618,12 +689,20 @@ class DashboardApp:
         self.domains_canvas = Canvas(right, height=230, background="#f8f9fb", highlightthickness=1, highlightbackground="#d9dde5")
         self.domains_canvas.pack(fill=BOTH, expand=True, pady=(6, 0))
 
-        actions = Frame(self.dashboard_tab)
-        actions.pack(fill=X)
-        Button(actions, text="Export CSV", command=self.export_csv).pack(side=LEFT, padx=(0, 8))
-        Button(actions, text="Export XLSX", command=self.export_xlsx).pack(side=LEFT)
-
     def _build_timeline(self) -> None:
+        controls = Frame(self.timeline_tab)
+        controls.pack(fill=X, pady=(0, 8))
+        Label(controls, text="Domain filter").pack(side=LEFT, padx=(0, 8))
+        domain_filter = ttk.Combobox(
+            controls,
+            textvariable=self.timeline_domain_filter_var,
+            values=("All rows", "Only rows with domains", "Only rows without domains"),
+            state="readonly",
+            width=26,
+        )
+        domain_filter.pack(side=LEFT)
+        domain_filter.bind("<<ComboboxSelected>>", lambda _event: self._refresh_timeline())
+
         columns = ("start", "end", "duration", "type", "app", "domain", "title")
         self.timeline = ttk.Treeview(self.timeline_tab, columns=columns, show="headings")
         for column in columns:
@@ -635,7 +714,99 @@ class DashboardApp:
         self.timeline.column("app", width=130)
         self.timeline.column("domain", width=150)
         self.timeline.column("title", width=260)
+        self.timeline.tag_configure("plain", background="")
+        self.timeline.tag_configure("yellow", background="#fff2b8")
         self.timeline.pack(fill=BOTH, expand=True)
+
+    def _build_download(self) -> None:
+        Label(self.download_tab, text="Download activity by date", font=("Segoe UI", 14, "bold")).pack(anchor="w")
+        Label(
+            self.download_tab,
+            text="Choose one or more days that have recorded activity, then export those sessions.",
+        ).pack(anchor="w", pady=(4, 12))
+
+        controls = Frame(self.download_tab)
+        controls.pack(fill=X, pady=(0, 8))
+        Label(controls, text="Show").pack(side=LEFT, padx=(0, 8))
+        range_picker = ttk.Combobox(
+            controls,
+            textvariable=self.download_range_var,
+            values=("All available", "This week", "This month", "Calendar range"),
+            state="readonly",
+            width=18,
+        )
+        range_picker.pack(side=LEFT, padx=(0, 12))
+        range_picker.bind("<<ComboboxSelected>>", lambda _event: self._refresh_download_dates())
+        Label(controls, text="From").pack(side=LEFT)
+        Entry(controls, textvariable=self.download_start_var, width=12).pack(side=LEFT, padx=(4, 10))
+        Label(controls, text="To").pack(side=LEFT)
+        Entry(controls, textvariable=self.download_end_var, width=12).pack(side=LEFT, padx=(4, 10))
+        Button(controls, text="Apply", command=self._refresh_download_dates).pack(side=LEFT)
+
+        columns = ("date", "sessions", "active")
+        self.download_days = ttk.Treeview(
+            self.download_tab,
+            columns=columns,
+            show="headings",
+            height=12,
+            selectmode="extended",
+        )
+        self.download_days.heading("date", text="Date")
+        self.download_days.heading("sessions", text="Sessions")
+        self.download_days.heading("active", text="Active time")
+        self.download_days.column("date", width=160)
+        self.download_days.column("sessions", width=100, anchor="center")
+        self.download_days.column("active", width=140)
+        self.download_days.tag_configure("plain", background="")
+        self.download_days.tag_configure("yellow", background="#fff2b8")
+        self.download_days.pack(fill=BOTH, expand=True, pady=(0, 10))
+
+        actions = Frame(self.download_tab)
+        actions.pack(fill=X)
+        Button(actions, text="Select all shown", command=self.select_all_download_days).pack(side=LEFT, padx=(0, 8))
+        Button(actions, text="Export selected CSV", command=lambda: self.export_selected_days("csv")).pack(side=LEFT, padx=(0, 8))
+        Button(actions, text="Export selected XLSX", command=lambda: self.export_selected_days("xlsx")).pack(side=LEFT, padx=(0, 16))
+        Button(actions, text="Export today CSV", command=lambda: self.export_today("csv")).pack(side=LEFT, padx=(0, 8))
+        Button(actions, text="Export today XLSX", command=lambda: self.export_today("xlsx")).pack(side=LEFT)
+
+    def _build_guide(self) -> None:
+        guide = Text(self.guide_tab, wrap="word", height=24, padx=10, pady=10, background="#fbfcfe", relief="solid", borderwidth=1)
+        guide.pack(fill=BOTH, expand=True)
+        guide.tag_configure("h1", font=("Segoe UI", 17, "bold"), spacing3=8)
+        guide.tag_configure("h2", font=("Segoe UI", 12, "bold"), spacing1=10, spacing3=4)
+        guide.tag_configure("body", font=("Segoe UI", 10), spacing3=4)
+        guide.tag_configure("bullet", font=("Segoe UI", 10), lmargin1=18, lmargin2=34, spacing3=3)
+
+        sections = [
+            ("h1", "Activity Tracker Guide\n"),
+            ("body", "Activity Tracker is an offline Windows app that records the app or website you are actively using, summarizes your day, and lets you export your history for review.\n"),
+            ("h2", "\nMain Features\n"),
+            ("bullet", "- Dashboard: shows today's total active time, top apps, and top websites.\n"),
+            ("bullet", "- Timeline: lists recent sessions with start time, end time, duration, app, domain, and title.\n"),
+            ("bullet", "- Domain filtering: show all timeline rows, only rows with domains, or only rows without domains.\n"),
+            ("bullet", "- Download Data: export one day, several selected days, all shown days, or today's data as CSV or XLSX.\n"),
+            ("bullet", "- Date filtering: narrow downloadable dates to all available days, this week, this month, or a custom calendar range.\n"),
+            ("bullet", "- Browser tracking: the companion extension sends the active browser tab domain and title to the local desktop app.\n"),
+            ("bullet", "- Idle detection: idle time is recorded separately so active totals stay cleaner.\n"),
+            ("bullet", "- Pause and resume: temporarily stop recording without closing the app.\n"),
+            ("h2", "\nActivating the Browser Extension\n"),
+            ("bullet", "- Keep the Activity Tracker desktop app open first.\n"),
+            ("bullet", "- In Chrome, open chrome://extensions. In Edge, open edge://extensions.\n"),
+            ("bullet", "- Turn on Developer mode.\n"),
+            ("bullet", "- Click Load unpacked and select this project's browser-extension folder.\n"),
+            ("bullet", "- Leave the extension enabled. It sends the focused tab's browser name, domain, and title to http://127.0.0.1:8765/active-tab.\n"),
+            ("h2", "\nHow Data Is Stored\n"),
+            ("body", "The app stores activity locally in SQLite. Times are saved in UTC internally and displayed/exported in Philippines time (UTC+08:00). No cloud login, telemetry, or external API is used.\n"),
+            ("h2", "\nExporting Data\n"),
+            ("body", "Use Download Data for all exports. Only days with available activity appear in the list, and the Select all shown button selects every day currently visible after filtering.\n"),
+            ("h2", "\nTips\n"),
+            ("bullet", "- Keep the desktop app running while you work.\n"),
+            ("bullet", "- Install the browser extension for better website domain and page-title tracking.\n"),
+            ("bullet", "- Rows without domains usually mean normal desktop apps, idle time, or browser rows that could not be matched to tab data.\n"),
+        ]
+        for tag, text in sections:
+            guide.insert(END, text, tag)
+        guide.configure(state="disabled")
 
     def _build_settings(self) -> None:
         Label(self.settings_tab, text="Local data", font=("Segoe UI", 12, "bold")).pack(anchor="w")
@@ -659,6 +830,7 @@ class DashboardApp:
         self._draw_bars(self.apps_canvas, [(row["app_name"], int(row["total"])) for row in apps])
         self._draw_bars(self.domains_canvas, [(row["domain"], int(row["total"])) for row in domains])
         self._refresh_timeline()
+        self._refresh_download_dates(keep_selection=True)
         self.root.after(3000, self.refresh)
 
     def _draw_bars(self, canvas: Canvas, items: list[tuple[str, int]]) -> None:
@@ -682,10 +854,16 @@ class DashboardApp:
             self.timeline.delete(item)
         start, end = today_bounds()
         rows = self.db.sessions_between(start, end)[-100:]
-        for row in reversed(rows):
+        domain_filter = self.timeline_domain_filter_var.get()
+        if domain_filter == "Only rows with domains":
+            rows = [row for row in rows if row["domain"]]
+        elif domain_filter == "Only rows without domains":
+            rows = [row for row in rows if not row["domain"]]
+        for index, row in enumerate(reversed(rows)):
             self.timeline.insert(
                 "",
                 END,
+                tags=("plain" if index % 2 == 0 else "yellow",),
                 values=(
                     format_ph_datetime(row["started_at"]),
                     format_ph_datetime(row["ended_at"]),
@@ -697,29 +875,97 @@ class DashboardApp:
                 ),
             )
 
-    def export_csv(self) -> None:
-        target = filedialog.asksaveasfilename(
-            defaultextension=".csv",
-            filetypes=[("CSV files", "*.csv")],
-            initialfile="activity_export.csv",
-        )
-        if not target:
-            return
-        start, end = today_bounds()
-        rows = self.db.sessions_between(start, end)
-        write_csv(Path(target), rows)
+    def _download_filter_bounds(self) -> tuple[str | None, str | None]:
+        selected = self.download_range_var.get()
+        if selected == "This week":
+            return this_week_bounds()
+        if selected == "This month":
+            return this_month_bounds()
+        if selected == "Calendar range":
+            start_day = parse_date_entry(self.download_start_var.get())
+            end_day = parse_date_entry(self.download_end_var.get())
+            if not start_day or not end_day:
+                return None, None
+            if end_day < start_day:
+                start_day, end_day = end_day, start_day
+            return ph_range_bounds(start_day, end_day)
+        return None, None
 
-    def export_xlsx(self) -> None:
+    def _refresh_download_dates(self, keep_selection: bool = False) -> None:
+        selected_days = set(self._selected_download_days()) if keep_selection else set()
+        for item in self.download_days.get_children():
+            self.download_days.delete(item)
+
+        start, end = self._download_filter_bounds()
+        rows = self.db.available_days_between(start, end)
+        for index, row in enumerate(rows):
+            day = row["day"]
+            item = self.download_days.insert(
+                "",
+                END,
+                iid=day,
+                tags=("plain" if index % 2 == 0 else "yellow",),
+                values=(day, row["session_count"], display_duration(row["active_total"])),
+            )
+            if keep_selection and day in selected_days:
+                self.download_days.selection_set(item)
+
+    def _selected_download_days(self) -> list[str]:
+        if not hasattr(self, "download_days"):
+            return []
+        selection = self.download_days.selection()
+        if not selection:
+            return []
+        days = []
+        for item in selection:
+            values = self.download_days.item(item, "values")
+            if values:
+                days.append(str(values[0]))
+        return days
+
+    def select_all_download_days(self) -> None:
+        self.download_days.selection_set(self.download_days.get_children())
+
+    def _export_rows(self, rows: list[sqlite3.Row], file_type: str, initialfile: str) -> bool:
+        extension = ".xlsx" if file_type == "xlsx" else ".csv"
+        filetypes = [("Excel workbook", "*.xlsx")] if file_type == "xlsx" else [("CSV files", "*.csv")]
         target = filedialog.asksaveasfilename(
-            defaultextension=".xlsx",
-            filetypes=[("Excel workbook", "*.xlsx")],
-            initialfile="activity_export.xlsx",
+            defaultextension=extension,
+            filetypes=filetypes,
+            initialfile=initialfile,
         )
         if not target:
+            return False
+        if file_type == "xlsx":
+            write_xlsx(Path(target), rows)
+        else:
+            write_csv(Path(target), rows)
+        return True
+
+    def export_selected_days(self, file_type: str) -> None:
+        day_texts = self._selected_download_days()
+        selected_days = [day for day in (parse_date_entry(day_text) for day_text in day_texts) if day]
+        if not selected_days:
+            self.status_var.set("Choose one or more dates to export")
             return
-        start, end = today_bounds()
+
+        extension = ".xlsx" if file_type == "xlsx" else ".csv"
+        rows = []
+        for selected_day in sorted(selected_days):
+            start, end = ph_date_bounds(selected_day)
+            rows.extend(self.db.sessions_between(start, end))
+        label = day_texts[0] if len(day_texts) == 1 else "selected_dates"
+        if self._export_rows(rows, file_type, f"activity_{label}{extension}"):
+            self.status_var.set(f"Exported {len(selected_days)} selected date(s)")
+
+    def export_today(self, file_type: str) -> None:
+        extension = ".xlsx" if file_type == "xlsx" else ".csv"
+        today = datetime.now(PH_TZ).date()
+        day_text = today.strftime("%Y-%m-%d")
+        start, end = ph_date_bounds(today)
         rows = self.db.sessions_between(start, end)
-        write_xlsx(Path(target), rows)
+        if self._export_rows(rows, file_type, f"activity_today_{day_text}{extension}"):
+            self.status_var.set(f"Exported {day_text}")
 
 
 EXPORT_COLUMNS = [
