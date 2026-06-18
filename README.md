@@ -1,4 +1,4 @@
-# Activity Tracker
+# TrackTivity
 
 Offline-first Windows activity tracker inspired by Digital Wellbeing. It records the focused desktop application and, when the companion browser extension is installed, the focused Chrome/Edge tab domain and title.
 
@@ -35,7 +35,7 @@ python app\activity_tracker.py
 When running from source, the local database is created at:
 
 ```text
-%LOCALAPPDATA%\ActivityTracker\activity_tracker.sqlite3
+%LOCALAPPDATA%\TrackTivity\activity_tracker.sqlite3
 ```
 
 ## Build the Windows App
@@ -66,7 +66,7 @@ If PyInstaller is already installed, build without reinstalling requirements:
 The executable is created at:
 
 ```text
-release\Activity Tracker\Activity Tracker.exe
+release\TrackTivity\TrackTivity.exe
 ```
 
 You can open that `.exe` directly from File Explorer without VS Code or a terminal.
@@ -74,30 +74,24 @@ You can open that `.exe` directly from File Explorer without VS Code or a termin
 When running the packaged executable, the database is created inside the portable app folder:
 
 ```text
-release\Activity Tracker\data\activity_tracker.sqlite3
+release\TrackTivity\data\activity_tracker.sqlite3
 ```
 
-Keep the whole `release\Activity Tracker` folder together. The `data` folder contains that user's local activity history.
+Keep the whole `release\TrackTivity` folder together. The `data` folder contains that user's local activity history.
 
 After changing source code, rebuild the executable. The `.exe` does not update automatically from Python source changes.
 
-## Start Automatically After Laptop Login
+## System Tray Behavior
 
-After building the executable, add it to your Windows Startup folder:
+Closing the TrackTivity window hides the dashboard to the Windows system tray. Tracking, idle detection, SQLite saving, and browser-extension tracking continue while the dashboard is hidden.
 
-```powershell
-.\scripts\install-startup-shortcut.ps1
-```
+Use the tray icon to reopen or fully quit the app:
 
-This creates a shortcut named `Activity Tracker.lnk` in your user Startup folder. Windows will launch the app after you sign in.
+- Click or open the tray icon to show the dashboard.
+- Right-click the tray icon and choose `Open Dashboard` to show the dashboard.
+- Right-click the tray icon and choose `Quit` to fully exit TrackTivity.
 
-To remove the startup shortcut:
-
-```powershell
-.\scripts\install-startup-shortcut.ps1 -Remove
-```
-
-The app has a single-instance guard. If it is already running and you open it again, it shows a message instead of starting a second copy.
+You can also fully exit from the Settings tab by clicking `Quit TrackTivity`.
 
 ## Install the Browser Extension Manually
 

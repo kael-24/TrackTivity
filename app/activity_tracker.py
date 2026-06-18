@@ -18,11 +18,13 @@ from pathlib import Path
 from tkinter import BOTH, END, LEFT, RIGHT, X, Y, Button, Canvas, Entry, Frame, Label, StringVar, Text, Tk, filedialog, ttk
 from urllib.parse import urlparse
 
+import pystray
+from PIL import Image, ImageDraw, ImageFont
 
-APP_NAME = "Activity Tracker"
+APP_NAME = "TrackTivity"
 HTTP_HOST = "127.0.0.1"
 HTTP_PORT = 8765
-INSTANCE_MUTEX_NAME = "Local\\ActivityTrackerDesktopApp"
+INSTANCE_MUTEX_NAME = "Local\\TrackTivityDesktopApp"
 PH_TZ = timezone(timedelta(hours=8), name="PHT")
 FOCUS_POLL_SECONDS = 1
 SESSION_SAVE_INTERVAL_SECONDS = 5
@@ -117,7 +119,7 @@ def local_data_dir() -> Path:
 
     base = os.environ.get("LOCALAPPDATA")
     if base:
-        return Path(base) / "ActivityTracker"
+        return Path(base) / "TrackTivity"
     return Path.cwd() / "data"
 
 
@@ -627,12 +629,58 @@ class ActivityRecorder:
         self.last_session_save_at = 0.0
 
 
+class TrayController:
+    def __init__(self, root: Tk, open_dashboard: callable, quit_app: callable) -> None:
+        self.root = root
+        self.open_dashboard = open_dashboard
+        self.quit_app = quit_app
+        self.icon = pystray.Icon(
+            APP_NAME,
+            self._create_icon_image(),
+            APP_NAME,
+            pystray.Menu(
+                pystray.MenuItem("Open Dashboard", self._open_dashboard, default=True),
+                pystray.MenuItem("Quit", self._quit_app),
+            ),
+        )
+        self.thread = threading.Thread(target=self.icon.run, daemon=True)
+
+    def start(self) -> None:
+        self.thread.start()
+
+    def stop(self) -> None:
+        self.icon.stop()
+
+    def _open_dashboard(self, _icon: pystray.Icon, _item: pystray.MenuItem) -> None:
+        self.root.after(0, self.open_dashboard)
+
+    def _quit_app(self, _icon: pystray.Icon, _item: pystray.MenuItem) -> None:
+        self.root.after(0, self.quit_app)
+
+    def _create_icon_image(self) -> Image.Image:
+        image = Image.new("RGBA", (64, 64), "#2563eb")
+        draw = ImageDraw.Draw(image)
+        draw.rectangle((6, 6, 58, 58), outline="#ffffff", width=3)
+        try:
+            font = ImageFont.truetype("arial.ttf", 24)
+        except OSError:
+            font = ImageFont.load_default()
+        text = "TT"
+        bbox = draw.textbbox((0, 0), text, font=font)
+        x = (64 - (bbox[2] - bbox[0])) / 2
+        y = (64 - (bbox[3] - bbox[1])) / 2 - 1
+        draw.text((x, y), text, fill="#ffffff", font=font)
+        return image
+
+
 class DashboardApp:
     def __init__(self, root: Tk, db: ActivityDatabase, recorder: ActivityRecorder, server: ExtensionServer) -> None:
         self.root = root
         self.db = db
         self.recorder = recorder
         self.server = server
+        self.tray: TrayController | None = None
+        self.is_quitting = False
         self.status_var = StringVar(value="Starting")
         self.total_var = StringVar(value="Today: 0s")
         self.pause_var = StringVar(value="Pause")
@@ -644,6 +692,8 @@ class DashboardApp:
         self.root.geometry("980x660")
         self._build()
         self.refresh()
+        self.tray = TrayController(self.root, self.open_dashboard, self.quit_application)
+        self.tray.start()
 
     def _build(self) -> None:
         top = Frame(self.root, padx=12, pady=10)
@@ -778,8 +828,8 @@ class DashboardApp:
         guide.tag_configure("bullet", font=("Segoe UI", 10), lmargin1=18, lmargin2=34, spacing3=3)
 
         sections = [
-            ("h1", "Activity Tracker Guide\n"),
-            ("body", "Activity Tracker is an offline Windows app that records the app or website you are actively using, summarizes your day, and lets you export your history for review.\n"),
+            ("h1", "TrackTivity Guide\n"),
+            ("body", "TrackTivity is an offline Windows app that records the app or website you are actively using, summarizes your day, and lets you export your history for review.\n"),
             ("h2", "\nMain Features\n"),
             ("bullet", "- Dashboard: shows today's total active time, top apps, and top websites.\n"),
             ("bullet", "- Timeline: lists recent sessions with start time, end time, duration, app, domain, and title.\n"),
@@ -790,7 +840,7 @@ class DashboardApp:
             ("bullet", "- Idle detection: idle time is recorded separately so active totals stay cleaner.\n"),
             ("bullet", "- Pause and resume: temporarily stop recording without closing the app.\n"),
             ("h2", "\nActivating the Browser Extension\n"),
-            ("bullet", "- Keep the Activity Tracker desktop app open first.\n"),
+            ("bullet", "- Keep the TrackTivity desktop app running first.\n"),
             ("bullet", "- In Chrome, open chrome://extensions. In Edge, open edge://extensions.\n"),
             ("bullet", "- Turn on Developer mode.\n"),
             ("bullet", "- Click Load unpacked and select this project's browser-extension folder.\n"),
@@ -817,6 +867,27 @@ class DashboardApp:
         Label(self.settings_tab, text="Focus check: every 1 second").pack(anchor="w")
         Label(self.settings_tab, text="SQLite save interval: every 5 seconds while a session is unchanged").pack(anchor="w")
         Label(self.settings_tab, text="Idle timeout: 5 minutes by default; idle is recorded, not paused").pack(anchor="w")
+        Label(self.settings_tab, text="App control", font=("Segoe UI", 12, "bold")).pack(anchor="w", pady=(18, 4))
+        Label(self.settings_tab, text="Closing the window keeps TrackTivity running in the system tray.").pack(anchor="w")
+        Button(self.settings_tab, text="Quit TrackTivity", command=self.quit_application).pack(anchor="w", pady=(8, 0))
+
+    def hide_to_tray(self) -> None:
+        self.root.withdraw()
+
+    def open_dashboard(self) -> None:
+        self.root.deiconify()
+        self.root.lift()
+        self.root.focus_force()
+
+    def quit_application(self) -> None:
+        if self.is_quitting:
+            return
+        self.is_quitting = True
+        if self.tray:
+            self.tray.stop()
+        self.recorder.stop()
+        self.server.stop()
+        self.root.destroy()
 
     def toggle_pause(self) -> None:
         self.recorder.set_paused(not self.recorder.paused)
@@ -824,6 +895,8 @@ class DashboardApp:
         self.refresh()
 
     def refresh(self) -> None:
+        if self.is_quitting:
+            return
         apps, domains, total = self.db.aggregate_today()
         self.status_var.set(self.recorder.status)
         self.total_var.set(f"Today: {display_duration(total)}")
@@ -831,7 +904,8 @@ class DashboardApp:
         self._draw_bars(self.domains_canvas, [(row["domain"], int(row["total"])) for row in domains])
         self._refresh_timeline()
         self._refresh_download_dates(keep_selection=True)
-        self.root.after(3000, self.refresh)
+        if not self.is_quitting:
+            self.root.after(3000, self.refresh)
 
     def _draw_bars(self, canvas: Canvas, items: list[tuple[str, int]]) -> None:
         canvas.delete("all")
@@ -1067,7 +1141,7 @@ def main() -> None:
     if already_running():
         ctypes.windll.user32.MessageBoxW(
             None,
-            "Activity Tracker is already running.",
+            "TrackTivity is already running.",
             APP_NAME,
             0x40,
         )
@@ -1084,9 +1158,7 @@ def main() -> None:
     app = DashboardApp(root, db, recorder, server)
 
     def on_close() -> None:
-        recorder.stop()
-        server.stop()
-        root.destroy()
+        app.hide_to_tray()
 
     root.protocol("WM_DELETE_WINDOW", on_close)
     root.mainloop()

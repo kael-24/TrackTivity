@@ -8,31 +8,33 @@ $AppScript = Join-Path $ProjectRoot "app\activity_tracker.py"
 $DistPath = Join-Path $ProjectRoot "release"
 $WorkPath = Join-Path $ProjectRoot ".pyinstaller\build"
 $SpecPath = Join-Path $ProjectRoot ".pyinstaller"
+$VenvPython = Join-Path $ProjectRoot ".venv\Scripts\python.exe"
+$PythonExe = if (Test-Path $VenvPython) { $VenvPython } else { "python" }
 
 Set-Location $ProjectRoot
 
 if ($InstallBuildRequirements) {
-    python -m pip install -r requirements-build.txt
+    & $PythonExe -m pip install -r requirements-build.txt
 }
 
-$pyinstallerVersion = python -m PyInstaller --version 2>$null
+$pyinstallerVersion = & $PythonExe -m PyInstaller --version 2>$null
 if ($LASTEXITCODE -ne 0) {
     throw "PyInstaller is not installed. Run: .\scripts\build-windows-exe.ps1 -InstallBuildRequirements"
 }
 
 Write-Host "Using PyInstaller $pyinstallerVersion"
 
-python -m PyInstaller `
+& $PythonExe -m PyInstaller `
     --noconfirm `
     --clean `
     --windowed `
-    --name "Activity Tracker" `
+    --name "TrackTivity" `
     --distpath $DistPath `
     --workpath $WorkPath `
     --specpath $SpecPath `
     $AppScript
 
-$ExePath = Join-Path $DistPath "Activity Tracker\Activity Tracker.exe"
+$ExePath = Join-Path $DistPath "TrackTivity\TrackTivity.exe"
 if (!(Test-Path $ExePath)) {
     throw "Build completed, but the executable was not found at $ExePath"
 }
