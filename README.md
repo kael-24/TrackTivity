@@ -29,8 +29,11 @@ There are two ways to run the app:
 For development, run:
 
 ```powershell
+python -m pip install -r requirements.txt
 python app\activity_tracker.py
 ```
+
+In Git Bash, use `python app/activity_tracker.py` after activating `.venv`. Avoid `py app/activity_tracker.py` because the Windows `py` launcher can ignore the activated virtual environment.
 
 When running from source, the local database is created at:
 

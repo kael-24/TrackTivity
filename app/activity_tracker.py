@@ -1,3 +1,4 @@
+#!/usr/bin/env python
 from __future__ import annotations
 
 import csv
@@ -15,7 +16,7 @@ from dataclasses import dataclass
 from datetime import UTC, date, datetime, timedelta, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
-from tkinter import BOTH, END, LEFT, RIGHT, X, Y, Button, Canvas, Entry, Frame, Label, StringVar, Text, Tk, filedialog, ttk
+from tkinter import BOTH, END, LEFT, RIGHT, X, Y, Button, Canvas, Entry, Frame, Label, StringVar, Text, Tk, filedialog, font as tkfont, ttk
 from urllib.parse import urlparse
 
 import pystray
@@ -33,6 +34,14 @@ BROWSER_PROCESSES = {
     "msedge.exe": "Edge",
     "firefox.exe": "Firefox",
 }
+IDLE_TIMEOUT_SECONDS = 180
+DASHBOARD_RANGES = {
+    "Today": "today",
+    "This week": "week",
+    "This month": "month",
+    "All time": "all",
+}
+DASHBOARD_COLORS = ("#2563eb", "#16a34a", "#f97316", "#9333ea", "#0f766e")
 
 
 def now_utc_iso() -> str:
@@ -97,6 +106,26 @@ def this_month_bounds() -> tuple[str, str]:
     ph_today = datetime.now(PH_TZ).date()
     month_start = ph_today.replace(day=1)
     return ph_range_bounds(month_start, ph_today)
+
+
+def dashboard_range_bounds(range_key: str) -> tuple[str | None, str | None]:
+    if range_key == "week":
+        return this_week_bounds()
+    if range_key == "month":
+        return this_month_bounds()
+    if range_key == "all":
+        return None, None
+    return today_bounds()
+
+
+def dashboard_range_label(range_key: str) -> str:
+    labels = {
+        "today": "today",
+        "week": "this week",
+        "month": "this month",
+        "all": "of all time",
+    }
+    return labels.get(range_key, "today")
 
 
 def parse_date_entry(value: str) -> date | None:
@@ -181,7 +210,20 @@ class ActivityDatabase:
                 """
             )
             self.conn.commit()
+            self.ensure_default_settings()
             self.repair_inferred_browser_sessions()
+
+    def ensure_default_settings(self) -> None:
+        row = self.conn.execute(
+            "select value from settings where key = 'idle_timeout_seconds'"
+        ).fetchone()
+        if not row or row["value"] == "300":
+            self.conn.execute(
+                "insert into settings(key, value) values('idle_timeout_seconds', ?) "
+                "on conflict(key) do update set value = excluded.value",
+                (str(IDLE_TIMEOUT_SECONDS),),
+            )
+            self.conn.commit()
 
     def get_setting(self, key: str, default: str) -> str:
         with self.lock:
@@ -305,44 +347,55 @@ class ActivityDatabase:
                 )
             )
 
-    def aggregate_today(self) -> tuple[list[sqlite3.Row], list[sqlite3.Row], int]:
-        start, end = today_bounds()
+    def aggregate_dashboard(self, range_key: str) -> tuple[list[sqlite3.Row], list[sqlite3.Row], int, int]:
+        start, end = dashboard_range_bounds(range_key)
+        clauses = []
+        params: list[str] = []
+        if start:
+            clauses.append("started_at >= ?")
+            params.append(start)
+        if end:
+            clauses.append("started_at < ?")
+            params.append(end)
+        bounds = " and " + " and ".join(clauses) if clauses else ""
         with self.lock:
             apps = list(
                 self.conn.execute(
-                    """
+                    f"""
                     select app_name, sum(duration_seconds) as total
                     from activity_sessions
-                    where started_at >= ? and started_at < ? and activity_type != 'idle'
+                    where activity_type != 'idle'{bounds}
                     group by app_name
                     order by total desc
-                    limit 10
                     """,
-                    (start, end),
+                    tuple(params),
                 )
             )
             domains = list(
                 self.conn.execute(
-                    """
+                    f"""
                     select domain, sum(duration_seconds) as total
                     from activity_sessions
-                    where started_at >= ? and started_at < ? and domain != ''
+                    where domain != ''{bounds}
                     group by domain
                     order by total desc
-                    limit 10
                     """,
-                    (start, end),
+                    tuple(params),
                 )
             )
             total_row = self.conn.execute(
-                """
-                select coalesce(sum(duration_seconds), 0) as total
+                f"""
+                select
+                    coalesce(sum(case when activity_type != 'idle' then duration_seconds else 0 end), 0) as active_total,
+                    coalesce(sum(case when activity_type = 'idle' then duration_seconds else 0 end), 0) as idle_total
                 from activity_sessions
-                where started_at >= ? and started_at < ? and activity_type != 'idle'
+                where 1 = 1{bounds}
                 """,
-                (start, end),
+                tuple(params),
             ).fetchone()
-            return apps, domains, int(total_row["total"] if total_row else 0)
+            active_total = int(total_row["active_total"] if total_row else 0)
+            idle_total = int(total_row["idle_total"] if total_row else 0)
+            return apps, domains, active_total, idle_total
 
 
 class WindowsForegroundReader:
@@ -571,7 +624,7 @@ class ActivityRecorder:
         if self.paused:
             return
 
-        idle_limit = int(self.db.get_setting("idle_timeout_seconds", "300"))
+        idle_limit = int(self.db.get_setting("idle_timeout_seconds", str(IDLE_TIMEOUT_SECONDS)))
         if self.reader.idle_seconds() >= idle_limit:
             state = ActivityState("idle", "Idle", "", "", "", "Idle")
         else:
@@ -680,9 +733,15 @@ class DashboardApp:
         self.recorder = recorder
         self.server = server
         self.tray: TrayController | None = None
+        self.refresh_after_id: str | None = None
         self.is_quitting = False
         self.status_var = StringVar(value="Starting")
-        self.total_var = StringVar(value="Today: 0s")
+        self.dashboard_range_var = StringVar(value="Today")
+        self.dashboard_title_var = StringVar(value="Today")
+        self.total_var = StringVar(value="Active: 0s")
+        self.idle_var = StringVar(value="Idle: 0s")
+        self.apps_title_var = StringVar(value="Top apps today")
+        self.domains_title_var = StringVar(value="Top websites today")
         self.pause_var = StringVar(value="Pause")
         self.timeline_domain_filter_var = StringVar(value="All rows")
         self.download_range_var = StringVar(value="All available")
@@ -723,21 +782,79 @@ class DashboardApp:
         self._build_settings()
 
     def _build_dashboard(self) -> None:
-        Label(self.dashboard_tab, textvariable=self.total_var, font=("Segoe UI", 20, "bold")).pack(anchor="w")
-        charts = Frame(self.dashboard_tab)
-        charts.pack(fill=BOTH, expand=True, pady=12)
+        self.dashboard_canvas = Canvas(self.dashboard_tab, highlightthickness=0, background="#f3f4f6")
+        dashboard_scrollbar = ttk.Scrollbar(self.dashboard_tab, orient="vertical", command=self.dashboard_canvas.yview)
+        self.dashboard_canvas.configure(yscrollcommand=dashboard_scrollbar.set)
+        dashboard_scrollbar.pack(side=RIGHT, fill=Y)
+        self.dashboard_canvas.pack(side=LEFT, fill=BOTH, expand=True)
 
-        left = Frame(charts)
+        self.dashboard_content = Frame(self.dashboard_canvas, background="#f3f4f6")
+        self.dashboard_content_window = self.dashboard_canvas.create_window(
+            (0, 0),
+            window=self.dashboard_content,
+            anchor="nw",
+        )
+        self.dashboard_content.bind(
+            "<Configure>",
+            lambda _event: self.dashboard_canvas.configure(scrollregion=self.dashboard_canvas.bbox("all")),
+        )
+        self.dashboard_canvas.bind(
+            "<Configure>",
+            lambda event: self.dashboard_canvas.itemconfigure(self.dashboard_content_window, width=event.width),
+        )
+        self.dashboard_canvas.bind("<Enter>", self._bind_dashboard_mousewheel)
+        self.dashboard_canvas.bind("<Leave>", self._unbind_dashboard_mousewheel)
+
+        header = Frame(self.dashboard_content, background="#f3f4f6")
+        header.pack(fill=X)
+        summary = Frame(header, background="#f3f4f6")
+        summary.pack(side=LEFT, fill=X, expand=True)
+        Label(summary, textvariable=self.dashboard_title_var, font=("Segoe UI", 18, "bold"), background="#f3f4f6").pack(anchor="w")
+        metrics = Frame(summary, background="#f3f4f6")
+        metrics.pack(anchor="w", pady=(6, 0))
+        Label(metrics, textvariable=self.total_var, font=("Segoe UI", 11, "bold"), foreground="#1f2937", background="#f3f4f6").pack(side=LEFT, padx=(0, 18))
+        Label(metrics, textvariable=self.idle_var, font=("Segoe UI", 11), foreground="#4b5563", background="#f3f4f6").pack(side=LEFT)
+
+        range_picker = ttk.Combobox(
+            header,
+            textvariable=self.dashboard_range_var,
+            values=tuple(DASHBOARD_RANGES.keys()),
+            state="readonly",
+            width=14,
+        )
+        range_picker.pack(side=RIGHT, pady=(4, 0))
+        range_picker.bind("<<ComboboxSelected>>", lambda _event: self.refresh())
+
+        charts = Frame(self.dashboard_content, background="#f3f4f6")
+        charts.pack(fill=BOTH, expand=True, pady=(16, 0))
+
+        left = Frame(charts, background="#f3f4f6")
         left.pack(side=LEFT, fill=BOTH, expand=True, padx=(0, 8))
-        Label(left, text="Top apps today", font=("Segoe UI", 11, "bold")).pack(anchor="w")
-        self.apps_canvas = Canvas(left, height=230, background="#f8f9fb", highlightthickness=1, highlightbackground="#d9dde5")
-        self.apps_canvas.pack(fill=BOTH, expand=True, pady=(6, 0))
+        Label(left, textvariable=self.apps_title_var, font=("Segoe UI", 11, "bold"), background="#f3f4f6").pack(anchor="w")
+        apps_list = Frame(left, background="#f3f4f6")
+        apps_list.pack(fill=X, pady=(6, 10))
+        self.apps_canvas = Canvas(apps_list, height=320, background="#fbfcfe", highlightthickness=1, highlightbackground="#d9dde5")
+        apps_scrollbar = ttk.Scrollbar(apps_list, orient="vertical", command=self.apps_canvas.yview)
+        self.apps_canvas.configure(yscrollcommand=apps_scrollbar.set)
+        self.apps_canvas.bind("<MouseWheel>", lambda event: self._on_list_mousewheel(event, self.apps_canvas))
+        self.apps_canvas.pack(side=LEFT, fill=X, expand=True)
+        apps_scrollbar.pack(side=RIGHT, fill=Y)
+        self.apps_pie_canvas = Canvas(left, height=210, background="#fbfcfe", highlightthickness=1, highlightbackground="#d9dde5")
+        self.apps_pie_canvas.pack(fill=BOTH, expand=True)
 
-        right = Frame(charts)
+        right = Frame(charts, background="#f3f4f6")
         right.pack(side=RIGHT, fill=BOTH, expand=True, padx=(8, 0))
-        Label(right, text="Top websites today", font=("Segoe UI", 11, "bold")).pack(anchor="w")
-        self.domains_canvas = Canvas(right, height=230, background="#f8f9fb", highlightthickness=1, highlightbackground="#d9dde5")
-        self.domains_canvas.pack(fill=BOTH, expand=True, pady=(6, 0))
+        Label(right, textvariable=self.domains_title_var, font=("Segoe UI", 11, "bold"), background="#f3f4f6").pack(anchor="w")
+        domains_list = Frame(right, background="#f3f4f6")
+        domains_list.pack(fill=X, pady=(6, 10))
+        self.domains_canvas = Canvas(domains_list, height=320, background="#fbfcfe", highlightthickness=1, highlightbackground="#d9dde5")
+        domains_scrollbar = ttk.Scrollbar(domains_list, orient="vertical", command=self.domains_canvas.yview)
+        self.domains_canvas.configure(yscrollcommand=domains_scrollbar.set)
+        self.domains_canvas.bind("<MouseWheel>", lambda event: self._on_list_mousewheel(event, self.domains_canvas))
+        self.domains_canvas.pack(side=LEFT, fill=X, expand=True)
+        domains_scrollbar.pack(side=RIGHT, fill=Y)
+        self.domains_pie_canvas = Canvas(right, height=210, background="#fbfcfe", highlightthickness=1, highlightbackground="#d9dde5")
+        self.domains_pie_canvas.pack(fill=BOTH, expand=True)
 
     def _build_timeline(self) -> None:
         controls = Frame(self.timeline_tab)
@@ -831,7 +948,7 @@ class DashboardApp:
             ("h1", "TrackTivity Guide\n"),
             ("body", "TrackTivity is an offline Windows app that records the app or website you are actively using, summarizes your day, and lets you export your history for review.\n"),
             ("h2", "\nMain Features\n"),
-            ("bullet", "- Dashboard: shows today's total active time, top apps, and top websites.\n"),
+            ("bullet", "- Dashboard: shows active time, idle time, top apps, top websites, and charts for today, this week, this month, or all time.\n"),
             ("bullet", "- Timeline: lists recent sessions with start time, end time, duration, app, domain, and title.\n"),
             ("bullet", "- Domain filtering: show all timeline rows, only rows with domains, or only rows without domains.\n"),
             ("bullet", "- Download Data: export one day, several selected days, all shown days, or today's data as CSV or XLSX.\n"),
@@ -866,7 +983,7 @@ class DashboardApp:
         Label(self.settings_tab, text="Display timezone: Philippines time (UTC+08:00)").pack(anchor="w")
         Label(self.settings_tab, text="Focus check: every 1 second").pack(anchor="w")
         Label(self.settings_tab, text="SQLite save interval: every 5 seconds while a session is unchanged").pack(anchor="w")
-        Label(self.settings_tab, text="Idle timeout: 5 minutes by default; idle is recorded, not paused").pack(anchor="w")
+        Label(self.settings_tab, text="Idle timeout: 3 minutes by default; idle is recorded, not paused").pack(anchor="w")
         Label(self.settings_tab, text="App control", font=("Segoe UI", 12, "bold")).pack(anchor="w", pady=(18, 4))
         Label(self.settings_tab, text="Closing the window keeps TrackTivity running in the system tray.").pack(anchor="w")
         Button(self.settings_tab, text="Quit TrackTivity", command=self.quit_application).pack(anchor="w", pady=(8, 0))
@@ -897,31 +1014,158 @@ class DashboardApp:
     def refresh(self) -> None:
         if self.is_quitting:
             return
-        apps, domains, total = self.db.aggregate_today()
+        selected_range = DASHBOARD_RANGES.get(self.dashboard_range_var.get(), "today")
+        apps, domains, active_total, idle_total = self.db.aggregate_dashboard(selected_range)
+        range_text = dashboard_range_label(selected_range)
         self.status_var.set(self.recorder.status)
-        self.total_var.set(f"Today: {display_duration(total)}")
-        self._draw_bars(self.apps_canvas, [(row["app_name"], int(row["total"])) for row in apps])
-        self._draw_bars(self.domains_canvas, [(row["domain"], int(row["total"])) for row in domains])
+        self.dashboard_title_var.set(self.dashboard_range_var.get())
+        self.total_var.set(f"Active: {display_duration(active_total)}")
+        self.idle_var.set(f"Idle: {display_duration(idle_total)}")
+        self.apps_title_var.set(f"Top apps {range_text}")
+        self.domains_title_var.set(f"Top websites {range_text}")
+        app_items = [(row["app_name"], int(row["total"])) for row in apps]
+        domain_items = [(row["domain"], int(row["total"])) for row in domains]
+        self._draw_bars(self.apps_canvas, app_items)
+        self._draw_bars(self.domains_canvas, domain_items)
+        self._draw_pie(self.apps_pie_canvas, app_items, "Apps")
+        self._draw_pie(self.domains_pie_canvas, domain_items, "Websites")
         self._refresh_timeline()
         self._refresh_download_dates(keep_selection=True)
         if not self.is_quitting:
-            self.root.after(3000, self.refresh)
+            if self.refresh_after_id:
+                self.root.after_cancel(self.refresh_after_id)
+            self.refresh_after_id = self.root.after(3000, self._scheduled_refresh)
+
+    def _scheduled_refresh(self) -> None:
+        self.refresh_after_id = None
+        self.refresh()
+
+    def _bind_dashboard_mousewheel(self, _event: object) -> None:
+        self.root.bind_all("<MouseWheel>", self._on_dashboard_mousewheel)
+
+    def _unbind_dashboard_mousewheel(self, _event: object) -> None:
+        self.root.unbind_all("<MouseWheel>")
+
+    def _on_dashboard_mousewheel(self, event: object) -> None:
+        delta = getattr(event, "delta", 0)
+        if delta:
+            self.dashboard_canvas.yview_scroll(int(-1 * (delta / 120)), "units")
+
+    def _on_list_mousewheel(self, event: object, canvas: Canvas) -> str:
+        delta = getattr(event, "delta", 0)
+        if delta:
+            canvas.yview_scroll(int(-1 * (delta / 120)), "units")
+        return "break"
 
     def _draw_bars(self, canvas: Canvas, items: list[tuple[str, int]]) -> None:
         canvas.delete("all")
-        width = max(canvas.winfo_width(), 420)
+        width = max(canvas.winfo_width(), 360)
+        label_font = tkfont.Font(family="Segoe UI", size=9)
+        value_font = tkfont.Font(family="Segoe UI", size=9, weight="bold")
+        left_pad = 14
+        right_pad = 14
+        value_space = 72
+        label_width = min(170, max(105, int(width * 0.34)))
+        bar_left = left_pad + label_width + 12
+        bar_right = max(bar_left + 40, width - right_pad - value_space)
         y = 16
         items = [(label, value) for label, value in items if value > 0]
         max_value = max([value for _, value in items], default=1)
         if not items:
-            canvas.create_text(18, 28, text="No activity yet", anchor="w", fill="#566070")
+            canvas.create_text(left_pad, 28, text="No activity yet", anchor="w", fill="#566070", font=label_font)
+            canvas.configure(scrollregion=(0, 0, width, 60))
             return
         for label, value in items:
-            bar_width = int((width - 180) * (value / max_value))
-            canvas.create_text(12, y + 9, text=label[:28], anchor="w", fill="#1f2937")
-            canvas.create_rectangle(150, y, 150 + bar_width, y + 18, fill="#2563eb", outline="")
-            canvas.create_text(160 + bar_width, y + 9, text=display_duration(value), anchor="w", fill="#1f2937")
-            y += 32
+            duration = display_duration(value)
+            bar_width = max(4, int((bar_right - bar_left) * (value / max_value)))
+            color = DASHBOARD_COLORS[(y // 30) % len(DASHBOARD_COLORS)]
+            canvas.create_text(
+                left_pad,
+                y + 9,
+                text=self._fit_text(label, label_width, label_font),
+                anchor="w",
+                fill="#1f2937",
+                font=label_font,
+            )
+            canvas.create_rectangle(bar_left, y, bar_right, y + 18, fill="#eef2f7", outline="")
+            canvas.create_rectangle(bar_left, y, bar_left + bar_width, y + 18, fill=color, outline="")
+            canvas.create_text(
+                width - right_pad,
+                y + 9,
+                text=duration,
+                anchor="e",
+                fill="#1f2937",
+                font=value_font,
+            )
+            y += 30
+        canvas.configure(scrollregion=(0, 0, width, y + 10))
+
+    def _draw_pie(self, canvas: Canvas, items: list[tuple[str, int]], title: str) -> None:
+        canvas.delete("all")
+        width = max(canvas.winfo_width(), 360)
+        height = max(canvas.winfo_height(), 190)
+        label_font = tkfont.Font(family="Segoe UI", size=9)
+        title_font = tkfont.Font(family="Segoe UI", size=10, weight="bold")
+        pie_items = self._pie_items(items)
+        if not pie_items:
+            canvas.create_text(14, 24, text=f"{title} share", anchor="w", fill="#111827", font=title_font)
+            canvas.create_text(14, 52, text="No activity yet", anchor="w", fill="#566070", font=label_font)
+            return
+
+        total = sum(value for _, value in pie_items)
+        size = min(128, height - 46, max(88, int(width * 0.32)))
+        x0 = 18
+        y0 = 46
+        x1 = x0 + size
+        y1 = y0 + size
+        canvas.create_text(14, 22, text=f"{title} share", anchor="w", fill="#111827", font=title_font)
+        start_angle = 90
+        for index, (_label, value) in enumerate(pie_items):
+            extent = 360 * value / total if total else 0
+            canvas.create_arc(
+                x0,
+                y0,
+                x1,
+                y1,
+                start=start_angle,
+                extent=-extent,
+                fill=DASHBOARD_COLORS[index % len(DASHBOARD_COLORS)],
+                outline="#fbfcfe",
+            )
+            start_angle -= extent
+
+        legend_x = x1 + 18
+        legend_width = max(80, width - legend_x - 14)
+        legend_y = y0 + 2
+        for index, (label, value) in enumerate(pie_items):
+            color = DASHBOARD_COLORS[index % len(DASHBOARD_COLORS)]
+            percent = int(round((value / total) * 100)) if total else 0
+            text = f"{label} ({percent}%)"
+            canvas.create_rectangle(legend_x, legend_y + 3, legend_x + 10, legend_y + 13, fill=color, outline="")
+            canvas.create_text(
+                legend_x + 16,
+                legend_y + 8,
+                text=self._fit_text(text, legend_width - 16, label_font),
+                anchor="w",
+                fill="#1f2937",
+                font=label_font,
+            )
+            legend_y += 24
+
+    def _pie_items(self, items: list[tuple[str, int]]) -> list[tuple[str, int]]:
+        positive = [(label, value) for label, value in items if value > 0]
+        if len(positive) <= 5:
+            return positive[:5]
+        others = sum(value for _, value in positive[4:])
+        return positive[:4] + [("Others", others)]
+
+    def _fit_text(self, text: str, max_width: int, text_font: tkfont.Font) -> str:
+        if text_font.measure(text) <= max_width:
+            return text
+        ellipsis = "..."
+        while text and text_font.measure(text + ellipsis) > max_width:
+            text = text[:-1]
+        return f"{text}{ellipsis}" if text else ellipsis
 
     def _refresh_timeline(self) -> None:
         for item in self.timeline.get_children():
